@@ -30,6 +30,33 @@ def test_dataset_loads_documents_queries_and_qrels(tmp_path) -> None:
     assert dataset.qrels["q1"]["d1"] == 2
 
 
+def test_beir_style_layout_is_supported(tmp_path) -> None:
+    root = tmp_path / "beir"
+    (root / "qrels").mkdir(parents=True)
+    (root / "corpus.jsonl").write_text(
+        json.dumps({"_id": "d1", "title": "Title", "text": "Body"}) + "\n",
+        encoding="utf-8",
+    )
+    (root / "queries.jsonl").write_text(
+        json.dumps({"_id": "q1", "text": "query"}) + "\n",
+        encoding="utf-8",
+    )
+    (root / "qrels" / "test.tsv").write_text(
+        "query-id\tcorpus-id\tscore\nq1\td1\t1\n",
+        encoding="utf-8",
+    )
+
+    dataset = IRDataset.load(str(root))
+    assert dataset.documents[0].doc_id == "d1"
+    assert dataset.documents[0].text == "Title\nBody"
+    assert dataset.qrels["q1"]["d1"] == 1
+
+
+def test_trec_four_column_qrels_are_supported(tmp_path) -> None:
+    dataset = IRDataset.load(_write_dataset(tmp_path, "q1 0 d1 2\n"))
+    assert dataset.qrels["q1"]["d1"] == 2
+
+
 def test_unknown_document_in_qrels_is_rejected(tmp_path) -> None:
     with pytest.raises(ValueError, match="unknown doc"):
         IRDataset.load(_write_dataset(tmp_path, "q1\tmissing\t1\n"))
