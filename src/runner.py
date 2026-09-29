@@ -1,8 +1,9 @@
 # -*- coding: utf-8 -*-
-"""Experiment runner for prompt and submodular-selection ablations."""
+"""Experiment runner for ablations and benchmark comparisons."""
 
 from __future__ import annotations
 
+import csv
 import dataclasses
 import json
 from pathlib import Path
@@ -12,6 +13,13 @@ import numpy as np
 from loguru import logger
 from tabulate import tabulate
 
+from src.baselines import (
+    derive_topic_seed,
+    mmr_select,
+    random_select,
+    top_relevance_select,
+)
+from src.cache import CandidateCache
 from src.config import EmbeddingConfig, ExperimentConfig, LLMConfig
 from src.corpus import CorpusLoader
 from src.embeddings import LangChainM3EEmbedder
@@ -35,6 +43,11 @@ class AblationRunner:
         self.output_dir = Path(cfg.output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self._candidate_cache: dict[tuple[str, str], list[str]] = {}
+        self._disk_cache = (
+            CandidateCache(cfg.candidate_cache_dir)
+            if cfg.use_candidate_cache
+            else None
+        )
 
         self.embedder = LangChainM3EEmbedder(EmbeddingConfig(cfg.m3e_path))
         self.llm = OpenAILLM(LLMConfig(model_name=cfg.llm_model))
@@ -50,14 +63,18 @@ class AblationRunner:
 
         self._write_json(
             "experiment_config.json",
-            {"config": dataclasses.asdict(cfg), "corpus_chunks": len(self.corpus_texts)},
+            {
+                "config": dataclasses.asdict(cfg),
+                "corpus_chunks": len(self.corpus_texts),
+            },
         )
         logger.info(
-            "Runner initialized: topics={}, num_candidates={}, k={}, corpus_chunks={}",
+            "Runner initialized: topics={}, num_candidates={}, k={}, corpus_chunks={}, disk_cache={}",
             len(cfg.topics),
             cfg.num_candidates,
             cfg.k,
             len(self.corpus_texts),
+            bool(self._disk_cache),
         )
 
     def _write_json(self, filename: str, payload: dict[str, Any]) -> None:
@@ -70,16 +87,91 @@ class AblationRunner:
         )
         tmp.replace(target)
 
+    def _write_csv(
+        self,
+        filename: str,
+        fieldnames: list[str],
+        rows: list[dict[str, Any]],
+    ) -> None:
+        """Atomically write a UTF-8 CSV artifact."""
+        target = self.output_dir / filename
+        tmp = target.with_suffix(target.suffix + ".tmp")
+        with tmp.open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(rows)
+        tmp.replace(target)
+
+    def _candidate_cache_metadata(self, topic: str, mode: str) -> dict[str, Any]:
+        """Build a cache identity from every generation input that affects output."""
+        if mode == "simple":
+            user_prompt = self.llm.build_prompt_simple(topic, self.cfg.num_candidates)
+        elif mode == "structured":
+            user_prompt = self.llm.build_prompt_structured(topic, self.cfg.num_candidates)
+        else:
+            raise ValueError("unsupported candidate generation mode")
+
+        return {
+            "topic": topic,
+            "mode": mode,
+            "num_candidates": self.cfg.num_candidates,
+            "model_name": self.llm.cfg.model_name,
+            "temperature": self.llm.cfg.temperature,
+            "max_tokens": self.llm.cfg.max_tokens,
+            "system_prompt": self.llm.cfg.system_prompt,
+            "user_prompt": user_prompt,
+        }
+
     def _get_candidates(self, topic: str, mode: str) -> list[str]:
-        """Generate each topic/mode candidate set once and reuse it across ablations."""
+        """Reuse candidate sets in memory and, optionally, across process runs."""
         key = (topic, mode)
-        if key not in self._candidate_cache:
-            self._candidate_cache[key] = self.llm.generate_candidates(
-                topic,
-                self.cfg.num_candidates,
-                mode,
-            )
-        return list(self._candidate_cache[key])
+        if key in self._candidate_cache:
+            return list(self._candidate_cache[key])
+
+        metadata = self._candidate_cache_metadata(topic, mode)
+        if self._disk_cache is not None:
+            cached = self._disk_cache.load(metadata)
+            if cached is not None:
+                logger.info(
+                    "Candidate cache hit: topic={!r}, mode={}, count={}",
+                    topic,
+                    mode,
+                    len(cached),
+                )
+                self._candidate_cache[key] = cached
+                return list(cached)
+
+        generated = self.llm.generate_candidates(
+            topic,
+            self.cfg.num_candidates,
+            mode,
+        )
+        self._candidate_cache[key] = generated
+
+        if self._disk_cache is not None and generated:
+            path = self._disk_cache.store(metadata, generated)
+            logger.info("Candidate cache write: {}", path)
+
+        return list(generated)
+
+    def _evaluate_indices(
+        self,
+        candidates: list[str],
+        candidate_embeddings: np.ndarray,
+        topic_embedding: np.ndarray,
+        selected_indices: list[int],
+    ) -> EvaluationMetrics:
+        selected_queries = [candidates[index] for index in selected_indices]
+        selected_embeddings = (
+            candidate_embeddings[selected_indices]
+            if selected_indices
+            else None
+        )
+        return self.evaluator.evaluate(
+            selected_queries,
+            selected_embeddings,
+            topic_embedding,
+        )
 
     def run_prompt_ablation(self) -> None:
         """Compare simple and structured prompts on the same evaluation pipeline."""
@@ -150,7 +242,11 @@ class AblationRunner:
                 logger.error("Skipping topic {!r}: no valid candidates", topic)
                 self._write_json(
                     f"submod_ablation_{slugify(topic)}.json",
-                    {"topic": topic, "status": "skipped", "reason": "no valid candidates"},
+                    {
+                        "topic": topic,
+                        "status": "skipped",
+                        "reason": "no valid candidates",
+                    },
                 )
                 continue
 
@@ -164,9 +260,16 @@ class AblationRunner:
 
             cand_emb = self.embedder.encode(candidates)
             sim = pairwise_cosine(cand_emb)
-            rel = cosine_similarity_matrix(cand_emb, topic_emb[None, :]).reshape(-1)
+            rel = cosine_similarity_matrix(
+                cand_emb,
+                topic_emb[None, :],
+            ).reshape(-1)
 
-            obj_fl = FacilityLocationObjective(sim, rel, alpha=self.cfg.alpha)
+            obj_fl = FacilityLocationObjective(
+                sim,
+                rel,
+                alpha=self.cfg.alpha,
+            )
             obj_gc = GraphCutObjective(
                 sim,
                 rel,
@@ -174,35 +277,20 @@ class AblationRunner:
                 lambda_div=self.cfg.lambda_diversity,
             )
 
-            res_std_fl = StandardGreedySelector(obj_fl).select(self.cfg.k)
-            res_lazy_fl = LazyGreedySelector(obj_fl).select(self.cfg.k)
-            res_std_gc = StandardGreedySelector(obj_gc).select(self.cfg.k)
-            res_lazy_gc = LazyGreedySelector(obj_gc).select(self.cfg.k)
-
-            def eval_sel(res: GreedyResult) -> EvaluationMetrics:
-                selected_queries = [candidates[i] for i in res.selected_indices]
-                selected_emb = (
-                    cand_emb[res.selected_indices]
-                    if res.selected_indices
-                    else None
-                )
-                return self.evaluator.evaluate(
-                    selected_queries,
-                    selected_emb,
-                    topic_emb,
-                )
-
-            metrics = {
-                "FL_Std": eval_sel(res_std_fl),
-                "FL_Lazy": eval_sel(res_lazy_fl),
-                "GC_Std": eval_sel(res_std_gc),
-                "GC_Lazy": eval_sel(res_lazy_gc),
-            }
             results = {
-                "FL_Std": res_std_fl,
-                "FL_Lazy": res_lazy_fl,
-                "GC_Std": res_std_gc,
-                "GC_Lazy": res_lazy_gc,
+                "FL_Std": StandardGreedySelector(obj_fl).select(self.cfg.k),
+                "FL_Lazy": LazyGreedySelector(obj_fl).select(self.cfg.k),
+                "GC_Std": StandardGreedySelector(obj_gc).select(self.cfg.k),
+                "GC_Lazy": LazyGreedySelector(obj_gc).select(self.cfg.k),
+            }
+            metrics = {
+                name: self._evaluate_indices(
+                    candidates,
+                    cand_emb,
+                    topic_emb,
+                    result.selected_indices,
+                )
+                for name, result in results.items()
             }
 
             for name, result in results.items():
@@ -228,7 +316,7 @@ class AblationRunner:
                         for name, result in results.items()
                     },
                     "selected_queries": {
-                        name: [candidates[i] for i in result.selected_indices]
+                        name: [candidates[index] for index in result.selected_indices]
                         for name, result in results.items()
                     },
                     "objective_values": {
@@ -252,13 +340,22 @@ class AblationRunner:
 
             self._recheck_monotonicity(
                 topic,
-                {name: result.objective_values for name, result in results.items()},
+                {
+                    name: result.objective_values
+                    for name, result in results.items()
+                },
             )
             self._recheck_solution_consistency(
-                topic, res_std_fl, res_lazy_fl, "FacilityLocation"
+                topic,
+                results["FL_Std"],
+                results["FL_Lazy"],
+                "FacilityLocation",
             )
             self._recheck_solution_consistency(
-                topic, res_std_gc, res_lazy_gc, "GraphCut"
+                topic,
+                results["GC_Std"],
+                results["GC_Lazy"],
+                "GraphCut",
             )
 
         headers = [
@@ -272,6 +369,159 @@ class AblationRunner:
             "Coverage",
         ]
         logger.info("\n" + tabulate(rows, headers=headers, tablefmt="github"))
+
+    def run_baseline_benchmark(self) -> None:
+        """Compare submodular selectors against deterministic baseline methods."""
+        logger.info("[BENCH] Top-Relevance / MMR / Random / FL / GraphCut")
+        table_rows: list[list[Any]] = []
+        csv_rows: list[dict[str, Any]] = []
+
+        for topic in self.cfg.topics:
+            topic_emb = self.embedder.encode([topic])[0]
+            candidates = self._get_candidates(topic, "simple")
+            if not candidates:
+                logger.error("Skipping benchmark topic {!r}: no valid candidates", topic)
+                continue
+
+            cand_emb = self.embedder.encode(candidates)
+            sim = pairwise_cosine(cand_emb)
+            rel = cosine_similarity_matrix(
+                cand_emb,
+                topic_emb[None, :],
+            ).reshape(-1)
+
+            topic_seed = derive_topic_seed(self.cfg.random_seed, topic)
+            selections = {
+                "Top-Relevance": top_relevance_select(sim, rel, self.cfg.k),
+                "MMR": mmr_select(
+                    sim,
+                    rel,
+                    self.cfg.k,
+                    lambda_relevance=self.cfg.mmr_lambda,
+                ),
+                "Random": random_select(
+                    sim,
+                    rel,
+                    self.cfg.k,
+                    seed=topic_seed,
+                ),
+                "FacilityLocation": LazyGreedySelector(
+                    FacilityLocationObjective(
+                        sim,
+                        rel,
+                        alpha=self.cfg.alpha,
+                    )
+                ).select(self.cfg.k),
+                "GraphCut": LazyGreedySelector(
+                    GraphCutObjective(
+                        sim,
+                        rel,
+                        alpha=self.cfg.alpha,
+                        lambda_div=self.cfg.lambda_diversity,
+                    )
+                ).select(self.cfg.k),
+            }
+
+            metrics = {
+                name: self._evaluate_indices(
+                    candidates,
+                    cand_emb,
+                    topic_emb,
+                    result.selected_indices,
+                )
+                for name, result in selections.items()
+            }
+
+            topic_payload: dict[str, Any] = {
+                "topic": topic,
+                "candidate_count": len(candidates),
+                "benchmark_parameters": {
+                    "k": self.cfg.k,
+                    "alpha": self.cfg.alpha,
+                    "lambda_diversity": self.cfg.lambda_diversity,
+                    "mmr_lambda": self.cfg.mmr_lambda,
+                    "base_random_seed": self.cfg.random_seed,
+                    "topic_random_seed": topic_seed,
+                },
+                "methods": {},
+            }
+
+            for name, result in selections.items():
+                metric = metrics[name]
+                selected_indices = list(result.selected_indices)
+                runtime_sec = float(result.runtime_sec)
+
+                topic_payload["methods"][name] = {
+                    "selected_indices": selected_indices,
+                    "selected_queries": [
+                        candidates[index] for index in selected_indices
+                    ],
+                    "runtime_sec": runtime_sec,
+                    "metrics": dataclasses.asdict(metric),
+                }
+
+                row = {
+                    "topic": topic,
+                    "method": name,
+                    "candidate_count": len(candidates),
+                    "selected_count": len(selected_indices),
+                    "runtime_sec": runtime_sec,
+                    "mean_intra_similarity": metric.mean_intra_similarity,
+                    "median_intra_similarity": metric.median_intra_similarity,
+                    "duplicate_rate_08": metric.duplicate_rate_08,
+                    "avg_relevance_to_topic": metric.avg_relevance_to_topic,
+                    "coverage_score_vs_corpus": metric.coverage_score_vs_corpus,
+                }
+                csv_rows.append(row)
+                table_rows.append([
+                    topic,
+                    name,
+                    len(selected_indices),
+                    f"{runtime_sec:.4f}s",
+                    f"{metric.mean_intra_similarity:.3f}",
+                    f"{metric.duplicate_rate_08:.2%}",
+                    f"{metric.avg_relevance_to_topic:.3f}",
+                    f"{metric.coverage_score_vs_corpus:.3f}",
+                ])
+
+            self._write_json(
+                f"benchmark_{slugify(topic)}.json",
+                topic_payload,
+            )
+
+        fieldnames = [
+            "topic",
+            "method",
+            "candidate_count",
+            "selected_count",
+            "runtime_sec",
+            "mean_intra_similarity",
+            "median_intra_similarity",
+            "duplicate_rate_08",
+            "avg_relevance_to_topic",
+            "coverage_score_vs_corpus",
+        ]
+        self._write_csv(
+            "benchmark_summary.csv",
+            fieldnames,
+            csv_rows,
+        )
+
+        headers = [
+            "Topic",
+            "Method",
+            "#Selected",
+            "Runtime",
+            "MeanIntraSim",
+            "Dup@0.8",
+            "AvgRel",
+            "Coverage",
+        ]
+        logger.info("\n" + tabulate(table_rows, headers=headers, tablefmt="github"))
+        logger.info(
+            "Benchmark summary written to {}",
+            self.output_dir / "benchmark_summary.csv",
+        )
 
     @staticmethod
     def _recheck_monotonicity(

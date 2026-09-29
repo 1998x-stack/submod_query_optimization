@@ -57,12 +57,16 @@ class ExperimentConfig:
     k: int = 6
     alpha: float = 0.5
     lambda_diversity: float = 0.5
+    mmr_lambda: float = 0.6
+    random_seed: int = 42
     chunk_size: int = 800
     chunk_overlap: int = 120
     m3e_path: str = "model"
     data_dir: str = "data"
     output_dir: str = "output"
     llm_model: str = "gpt-4o"
+    candidate_cache_dir: str = ".cache/candidates"
+    use_candidate_cache: bool = True
 
     def __post_init__(self) -> None:
         self.topics = [topic.strip() for topic in self.topics if topic.strip()]
@@ -76,6 +80,10 @@ class ExperimentConfig:
             raise ValueError("alpha must be in [0, 1]")
         if not 0.0 <= self.lambda_diversity <= 1.0:
             raise ValueError("lambda_diversity must be in [0, 1]")
+        if not 0.0 <= self.mmr_lambda <= 1.0:
+            raise ValueError("mmr_lambda must be in [0, 1]")
+        if self.random_seed < 0:
+            raise ValueError("random_seed must be non-negative")
         if self.chunk_size <= 0:
             raise ValueError("chunk_size must be positive")
         if self.chunk_overlap < 0 or self.chunk_overlap >= self.chunk_size:
@@ -86,3 +94,5 @@ class ExperimentConfig:
             raise ValueError("output_dir must not be empty")
         if not self.llm_model.strip():
             raise ValueError("llm_model must not be empty")
+        if self.use_candidate_cache and not self.candidate_cache_dir.strip():
+            raise ValueError("candidate_cache_dir must not be empty when cache is enabled")
