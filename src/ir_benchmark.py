@@ -1,0 +1,318 @@
+# -*- coding: utf-8 -*-
+"""Qrels-backed offline benchmark for query expansion/selection methods."""
+
+from __future__ import annotations
+
+import csv
+import json
+from dataclasses import asdict
+from pathlib import Path
+from typing import Callable
+
+import numpy as np
+from loguru import logger
+
+from src.baselines import derive_topic_seed, mmr_select, random_select, top_relevance_select
+from src.config import ExperimentConfig
+from src.embeddings import LangChainM3EEmbedder
+from src.ir_dataset import IRDataset, IRQuery
+from src.ir_metrics import IRMetrics, evaluate_ranking
+from src.ir_retrieval import DenseMultiQueryRetriever
+from src.ir_stats import bootstrap_mean_ci
+from src.objectives import FacilityLocationObjective, GraphCutObjective
+from src.selectors import LazyGreedySelector
+from src.utils import cosine_similarity_matrix, pairwise_cosine
+
+
+CandidateProvider = Callable[[str, str], list[str]]
+
+
+class IRBenchmarkRunner:
+    """Evaluate selected expansion queries against document-level ground truth."""
+
+    METRIC_NAMES = ("precision", "recall", "hit_rate", "reciprocal_rank", "ndcg")
+
+    def __init__(
+        self,
+        cfg: ExperimentConfig,
+        embedder: LangChainM3EEmbedder,
+        candidate_provider: CandidateProvider,
+    ) -> None:
+        if not cfg.ir_dataset_dir:
+            raise ValueError("ir_dataset_dir is required for the IR benchmark")
+
+        self.cfg = cfg
+        self.embedder = embedder
+        self.candidate_provider = candidate_provider
+        self.dataset = IRDataset.load(cfg.ir_dataset_dir)
+        self.output_dir = Path(cfg.output_dir) / "ir"
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+
+        document_ids = [doc.doc_id for doc in self.dataset.documents]
+        document_texts = [doc.text for doc in self.dataset.documents]
+        logger.info("IR: embedding {} benchmark documents", len(document_texts))
+        document_embeddings = self.embedder.encode(document_texts)
+        self.retriever = DenseMultiQueryRetriever(document_ids, document_embeddings)
+
+    def run(self) -> None:
+        detail_rows: list[dict[str, object]] = []
+        max_cutoff = max(self.cfg.ir_cutoffs)
+
+        for query in self.dataset.queries:
+            rows = self._run_query(query, max_cutoff)
+            detail_rows.extend(rows)
+
+        self._write_detail(detail_rows)
+        summary_rows = self._summarize(detail_rows)
+        self._write_summary(summary_rows)
+        self._write_manifest()
+
+        logger.info(
+            "IR benchmark complete: queries={}, documents={}, variants={}, output={}",
+            len(self.dataset.queries),
+            len(self.dataset.documents),
+            len({str(row["variant"]) for row in detail_rows}),
+            self.output_dir,
+        )
+
+    def _run_query(self, query: IRQuery, max_cutoff: int) -> list[dict[str, object]]:
+        original_embedding = self.embedder.encode([query.text])
+        candidates = self.candidate_provider(query.text, "simple")
+        if not candidates:
+            raise RuntimeError(
+                f"IR query {query.query_id!r} produced no expansion candidates"
+            )
+
+        candidate_embeddings = self.embedder.encode(candidates)
+        similarity = pairwise_cosine(candidate_embeddings)
+        relevance = cosine_similarity_matrix(
+            candidate_embeddings,
+            original_embedding,
+        ).reshape(-1)
+
+        selections = self._build_selections(
+            query=query,
+            similarity=similarity,
+            relevance=relevance,
+        )
+        qrels = self.dataset.qrels[query.query_id]
+        rows: list[dict[str, object]] = []
+
+        for variant, run_index, selected_indices in selections:
+            selected_embeddings = (
+                candidate_embeddings[selected_indices]
+                if selected_indices
+                else np.empty((0, candidate_embeddings.shape[1]), dtype=np.float32)
+            )
+            retrieval_embeddings = np.concatenate(
+                [original_embedding, selected_embeddings],
+                axis=0,
+            )
+            ranking = self.retriever.rank(
+                retrieval_embeddings,
+                top_k=max_cutoff,
+            )
+
+            for cutoff in self.cfg.ir_cutoffs:
+                metrics = evaluate_ranking(ranking.doc_ids, qrels, cutoff)
+                rows.append(
+                    self._detail_row(
+                        query=query,
+                        variant=variant,
+                        run_index=run_index,
+                        selected_count=len(selected_indices),
+                        candidate_count=len(candidates),
+                        metrics=metrics,
+                    )
+                )
+
+        return rows
+
+    def _build_selections(
+        self,
+        *,
+        query: IRQuery,
+        similarity: np.ndarray,
+        relevance: np.ndarray,
+    ) -> list[tuple[str, int, list[int]]]:
+        selections: list[tuple[str, int, list[int]]] = [
+            ("OriginalQuery", 0, []),
+            (
+                "TopRelevance",
+                0,
+                top_relevance_select(similarity, relevance, self.cfg.k).selected_indices,
+            ),
+        ]
+
+        for mmr_lambda in self.cfg.ir_mmr_grid:
+            selected = mmr_select(
+                similarity,
+                relevance,
+                self.cfg.k,
+                lambda_relevance=mmr_lambda,
+            ).selected_indices
+            selections.append((f"MMR(lambda={mmr_lambda:g})", 0, selected))
+
+        for alpha in self.cfg.ir_alpha_grid:
+            selected = LazyGreedySelector(
+                FacilityLocationObjective(
+                    similarity,
+                    relevance,
+                    alpha=alpha,
+                )
+            ).select(self.cfg.k).selected_indices
+            selections.append((f"FacilityLocation(alpha={alpha:g})", 0, selected))
+
+        for alpha in self.cfg.ir_alpha_grid:
+            for lambda_div in self.cfg.ir_lambda_grid:
+                selected = LazyGreedySelector(
+                    GraphCutObjective(
+                        similarity,
+                        relevance,
+                        alpha=alpha,
+                        lambda_div=lambda_div,
+                    )
+                ).select(self.cfg.k).selected_indices
+                selections.append(
+                    (
+                        f"GraphCut(alpha={alpha:g},lambda={lambda_div:g})",
+                        0,
+                        selected,
+                    )
+                )
+
+        base_seed = derive_topic_seed(self.cfg.random_seed, query.query_id)
+        for repeat in range(self.cfg.ir_random_repeats):
+            selected = random_select(
+                similarity,
+                relevance,
+                self.cfg.k,
+                seed=base_seed + repeat,
+            ).selected_indices
+            selections.append(("Random", repeat, selected))
+
+        return selections
+
+    @staticmethod
+    def _detail_row(
+        *,
+        query: IRQuery,
+        variant: str,
+        run_index: int,
+        selected_count: int,
+        candidate_count: int,
+        metrics: IRMetrics,
+    ) -> dict[str, object]:
+        return {
+            "query_id": query.query_id,
+            "query_text": query.text,
+            "variant": variant,
+            "run_index": run_index,
+            "candidate_count": candidate_count,
+            "selected_count": selected_count,
+            "cutoff": metrics.cutoff,
+            "precision": metrics.precision,
+            "recall": metrics.recall,
+            "hit_rate": metrics.hit_rate,
+            "reciprocal_rank": metrics.reciprocal_rank,
+            "ndcg": metrics.ndcg,
+        }
+
+    def _summarize(
+        self,
+        detail_rows: list[dict[str, object]],
+    ) -> list[dict[str, object]]:
+        variants = sorted({str(row["variant"]) for row in detail_rows})
+        summary: list[dict[str, object]] = []
+
+        for variant in variants:
+            for cutoff in self.cfg.ir_cutoffs:
+                matching = [
+                    row
+                    for row in detail_rows
+                    if row["variant"] == variant and row["cutoff"] == cutoff
+                ]
+
+                # Repeated random runs are averaged within each query before
+                # macro averaging/bootstrap so queries remain the sampling unit.
+                per_query: dict[str, dict[str, list[float]]] = {}
+                for row in matching:
+                    query_metrics = per_query.setdefault(
+                        str(row["query_id"]),
+                        {name: [] for name in self.METRIC_NAMES},
+                    )
+                    for metric_name in self.METRIC_NAMES:
+                        query_metrics[metric_name].append(float(row[metric_name]))
+
+                output: dict[str, object] = {
+                    "variant": variant,
+                    "cutoff": cutoff,
+                    "query_count": len(per_query),
+                }
+                for metric_name in self.METRIC_NAMES:
+                    query_values = [
+                        float(np.mean(values[metric_name]))
+                        for values in per_query.values()
+                    ]
+                    ci = bootstrap_mean_ci(
+                        query_values,
+                        iterations=self.cfg.ir_bootstrap_iterations,
+                        seed=self.cfg.random_seed,
+                    )
+                    output[f"{metric_name}_mean"] = ci.mean
+                    output[f"{metric_name}_ci_low"] = ci.low
+                    output[f"{metric_name}_ci_high"] = ci.high
+                summary.append(output)
+
+        return summary
+
+    def _write_detail(self, rows: list[dict[str, object]]) -> None:
+        path = self.output_dir / "ir_benchmark_detail.csv"
+        self._write_csv(path, rows)
+
+    def _write_summary(self, rows: list[dict[str, object]]) -> None:
+        path = self.output_dir / "ir_benchmark_summary.csv"
+        self._write_csv(path, rows)
+
+    @staticmethod
+    def _write_csv(path: Path, rows: list[dict[str, object]]) -> None:
+        if not rows:
+            raise ValueError("cannot write an empty benchmark CSV")
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        with tmp.open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=list(rows[0].keys()))
+            writer.writeheader()
+            writer.writerows(rows)
+        tmp.replace(path)
+
+    def _write_manifest(self) -> None:
+        qrel_count = sum(len(items) for items in self.dataset.qrels.values())
+        positive_qrels = sum(
+            1
+            for items in self.dataset.qrels.values()
+            for relevance in items.values()
+            if relevance > 0
+        )
+        payload = {
+            "dataset_dir": self.cfg.ir_dataset_dir,
+            "document_count": len(self.dataset.documents),
+            "query_count": len(self.dataset.queries),
+            "qrel_count": qrel_count,
+            "positive_qrel_count": positive_qrels,
+            "cutoffs": list(self.cfg.ir_cutoffs),
+            "k": self.cfg.k,
+            "alpha_grid": list(self.cfg.ir_alpha_grid),
+            "lambda_grid": list(self.cfg.ir_lambda_grid),
+            "mmr_grid": list(self.cfg.ir_mmr_grid),
+            "random_repeats": self.cfg.ir_random_repeats,
+            "bootstrap_iterations": self.cfg.ir_bootstrap_iterations,
+            "retrieval": {
+                "similarity": "cosine",
+                "fusion": "max",
+                "query_set": "original query + selected expansion queries",
+            },
+        }
+        path = self.output_dir / "ir_benchmark_manifest.json"
+        tmp = path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp.replace(path)
