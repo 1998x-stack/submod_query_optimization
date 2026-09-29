@@ -29,7 +29,11 @@ def evaluate_ranking(
     qrels: dict[str, int],
     cutoff: int,
 ) -> IRMetrics:
-    """Evaluate one ranked list against one query's graded relevance judgments."""
+    """Evaluate one ranked list against one query's graded relevance judgments.
+
+    Unjudged documents are treated as non-relevant. Precision@k uses k as the
+    denominator, matching the standard fixed-cutoff definition.
+    """
     if cutoff <= 0:
         raise ValueError("cutoff must be positive")
     if len(ranked_doc_ids) != len(set(ranked_doc_ids)):
@@ -41,13 +45,8 @@ def evaluate_ranking(
 
     relevant_total = sum(1 for rel in qrels.values() if rel > 0)
     retrieved_relevant = sum(binary)
-    precision_denominator = min(cutoff, len(ranked_doc_ids))
 
-    precision = (
-        retrieved_relevant / precision_denominator
-        if precision_denominator > 0
-        else 0.0
-    )
+    precision = retrieved_relevant / cutoff
     recall = retrieved_relevant / relevant_total if relevant_total > 0 else 0.0
     hit_rate = 1.0 if retrieved_relevant > 0 else 0.0
 
