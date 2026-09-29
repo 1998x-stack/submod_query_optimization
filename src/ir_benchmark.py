@@ -156,84 +156,91 @@ class IRBenchmarkRunner:
             SelectionRun("OriginalQuery", 0, [], 0.0),
         ]
 
-        top = top_relevance_select(similarity, relevance, self.cfg.k)
-        selections.append(
-            SelectionRun(
-                "TopRelevance",
-                0,
-                top.selected_indices,
-                top.runtime_sec,
-            )
-        )
-
-        for mmr_lambda in self.cfg.ir_mmr_grid:
-            result = mmr_select(
-                similarity,
-                relevance,
-                self.cfg.k,
-                lambda_relevance=mmr_lambda,
-            )
+        for selection_k in self.cfg.ir_k_grid or (self.cfg.k,):
+            top = top_relevance_select(similarity, relevance, selection_k)
             selections.append(
                 SelectionRun(
-                    f"MMR(lambda={mmr_lambda:g})",
+                    f"TopRelevance(k={selection_k})",
                     0,
-                    result.selected_indices,
-                    result.runtime_sec,
+                    top.selected_indices,
+                    top.runtime_sec,
                 )
             )
 
-        for alpha in self.cfg.ir_alpha_grid:
-            result = LazyGreedySelector(
-                FacilityLocationObjective(
+            for mmr_lambda in self.cfg.ir_mmr_grid:
+                result = mmr_select(
                     similarity,
                     relevance,
-                    alpha=alpha,
+                    selection_k,
+                    lambda_relevance=mmr_lambda,
                 )
-            ).select(self.cfg.k)
-            selections.append(
-                SelectionRun(
-                    f"FacilityLocation(alpha={alpha:g})",
-                    0,
-                    result.selected_indices,
-                    result.runtime_sec,
-                )
-            )
-
-        for alpha in self.cfg.ir_alpha_grid:
-            for lambda_div in self.cfg.ir_lambda_grid:
-                result = LazyGreedySelector(
-                    GraphCutObjective(
-                        similarity,
-                        relevance,
-                        alpha=alpha,
-                        lambda_div=lambda_div,
-                    )
-                ).select(self.cfg.k)
                 selections.append(
                     SelectionRun(
-                        f"GraphCut(alpha={alpha:g},lambda={lambda_div:g})",
+                        f"MMR(k={selection_k},lambda={mmr_lambda:g})",
                         0,
                         result.selected_indices,
                         result.runtime_sec,
                     )
                 )
 
-        base_seed = derive_topic_seed(self.cfg.random_seed, query.query_id)
-        for repeat in range(self.cfg.ir_random_repeats):
-            result = random_select(
-                similarity,
-                relevance,
-                self.cfg.k,
-                seed=base_seed + repeat,
-            )
-            selections.append(
-                SelectionRun(
-                    "Random",
-                    repeat,
-                    result.selected_indices,
-                    result.runtime_sec,
+            for alpha in self.cfg.ir_alpha_grid:
+                result = LazyGreedySelector(
+                    FacilityLocationObjective(
+                        similarity,
+                        relevance,
+                        alpha=alpha,
+                    )
+                ).select(selection_k)
+                selections.append(
+                    SelectionRun(
+                        f"FacilityLocation(k={selection_k},alpha={alpha:g})",
+                        0,
+                        result.selected_indices,
+                        result.runtime_sec,
+                    )
                 )
+
+            for alpha in self.cfg.ir_alpha_grid:
+                for lambda_div in self.cfg.ir_lambda_grid:
+                    result = LazyGreedySelector(
+                        GraphCutObjective(
+                            similarity,
+                            relevance,
+                            alpha=alpha,
+                            lambda_div=lambda_div,
+                        )
+                    ).select(selection_k)
+                    selections.append(
+                        SelectionRun(
+                            (
+                                f"GraphCut(k={selection_k},alpha={alpha:g},"
+                                f"lambda={lambda_div:g})"
+                            ),
+                            0,
+                            result.selected_indices,
+                            result.runtime_sec,
+                        )
+                    )
+
+            base_seed = derive_topic_seed(
+                self.cfg.random_seed,
+                f"{query.query_id}:k={selection_k}",
             )
+            for repeat in range(self.cfg.ir_random_repeats):
+                result = random_select(
+                    similarity,
+                    relevance,
+                    selection_k,
+                    seed=base_seed + repeat,
+                )
+                selections.append(
+                    SelectionRun(
+                        f"Random(k={selection_k})",
+                        repeat,
+                        result.selected_indices,
+                        result.runtime_sec,
+                    )
+                )
 
         return selections
 
@@ -346,7 +353,8 @@ class IRBenchmarkRunner:
             "qrel_count": qrel_count,
             "positive_qrel_count": positive_qrels,
             "cutoffs": list(self.cfg.ir_cutoffs),
-            "k": self.cfg.k,
+            "selection_k_grid": list(self.cfg.ir_k_grid or (self.cfg.k,)),
+            "default_k": self.cfg.k,
             "alpha_grid": list(self.cfg.ir_alpha_grid),
             "lambda_grid": list(self.cfg.ir_lambda_grid),
             "mmr_grid": list(self.cfg.ir_mmr_grid),
