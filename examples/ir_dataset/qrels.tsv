@@ -1,0 +1,6 @@
+query_id	doc_id	relevance
+q1	d1	2
+q1	d2	2
+q1	d3	1
+q2	d3	2
+q2	d2	1
