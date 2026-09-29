@@ -71,6 +71,7 @@ class ExperimentConfig:
 
     ir_dataset_dir: str | None = None
     ir_cutoffs: tuple[int, ...] = (5, 10, 20)
+    ir_k_grid: tuple[int, ...] | None = None
     ir_alpha_grid: tuple[float, ...] = (0.5,)
     ir_lambda_grid: tuple[float, ...] = (0.5,)
     ir_mmr_grid: tuple[float, ...] = (0.6,)
@@ -114,6 +115,12 @@ class ExperimentConfig:
             raise ValueError("ir_cutoffs must contain positive integers")
         if len(set(self.ir_cutoffs)) != len(self.ir_cutoffs):
             raise ValueError("ir_cutoffs must not contain duplicates")
+        if self.ir_k_grid is None:
+            self.ir_k_grid = (self.k,)
+        if not self.ir_k_grid or any(value <= 0 for value in self.ir_k_grid):
+            raise ValueError("ir_k_grid must contain positive integers")
+        if len(set(self.ir_k_grid)) != len(self.ir_k_grid):
+            raise ValueError("ir_k_grid must not contain duplicates")
         _validate_probability_grid("ir_alpha_grid", self.ir_alpha_grid)
         _validate_probability_grid("ir_lambda_grid", self.ir_lambda_grid)
         _validate_probability_grid("ir_mmr_grid", self.ir_mmr_grid)
