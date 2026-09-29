@@ -1,75 +1,58 @@
 # -*- coding: utf-8 -*-
-"""Configuration dataclasses for the project.
-
-本模块集中管理项目中的各类配置（Embedding/LLM/实验参数等），
-以便在不同模块间统一传递，避免“魔法常量”与重复代码。
-
-遵循：
-- PEP 257：Docstring
-- PEP 8：命名与风格
-- 全量类型注解
-"""
+"""Central configuration dataclasses and validation."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List
 
 
-@dataclass
+@dataclass(slots=True)
 class EmbeddingConfig:
-    """Embedding 配置。
-
-    Attributes:
-        model_path: 本地 m3e 模型目录（如: "model"）。
-        batch_size: 向量化的批大小。
-        device: 设备标识，如 "cuda" / "cpu" / None(自动)。
-    """
+    """Embedding model configuration."""
 
     model_path: str = "model"
     batch_size: int = 32
     device: str | None = None
 
+    def __post_init__(self) -> None:
+        if not self.model_path.strip():
+            raise ValueError("model_path must not be empty")
+        if self.batch_size <= 0:
+            raise ValueError("batch_size must be positive")
 
-@dataclass
+
+@dataclass(slots=True)
 class LLMConfig:
-    """LLM（OpenAI GPT-4o）配置。
-
-    Attributes:
-        model_name: 模型名，如 "gpt-4o"。
-        temperature: 采样温度（建议 0.3~0.8）。
-        max_tokens: 最大生成 token。
-        system_prompt: 系统描述，强制只返回 JSON 数组。
-    """
+    """OpenAI client and generation configuration."""
 
     model_name: str = "gpt-4o"
     temperature: float = 0.7
     max_tokens: int = 800
+    request_timeout_sec: float = 60.0
+    max_retries: int = 2
     system_prompt: str = (
         "你是一位严谨的研究助理，只以 JSON 数组形式返回 N 条短查询字符串，"
         "每条长度不超过 16 个汉字或 10 个英文词，不要编号、不要描述。"
     )
 
+    def __post_init__(self) -> None:
+        if not self.model_name.strip():
+            raise ValueError("model_name must not be empty")
+        if not 0.0 <= self.temperature <= 2.0:
+            raise ValueError("temperature must be in [0, 2]")
+        if self.max_tokens <= 0:
+            raise ValueError("max_tokens must be positive")
+        if self.request_timeout_sec <= 0:
+            raise ValueError("request_timeout_sec must be positive")
+        if self.max_retries < 0:
+            raise ValueError("max_retries must be non-negative")
 
-@dataclass
+
+@dataclass(slots=True)
 class ExperimentConfig:
-    """实验配置（消融维度等）。
+    """Experiment-level parameters."""
 
-    Attributes:
-        topics: 要测试的一组主题。
-        num_candidates: 每个主题初始候选查询数。
-        k: 最终要选择的查询数。
-        alpha: 相关性权重（0~1）。
-        lambda_diversity: 图割法的多样性权重（0~1）。
-        chunk_size: 文本分块大小（字符）。
-        chunk_overlap: 分块重叠（字符）。
-        m3e_path: 本地 m3e 模型目录。
-        data_dir: 语料目录。
-        output_dir: 输出目录。
-        llm_model: OpenAI 模型名。
-    """
-
-    topics: List[str]
+    topics: list[str]
     num_candidates: int = 20
     k: int = 6
     alpha: float = 0.5
@@ -80,3 +63,26 @@ class ExperimentConfig:
     data_dir: str = "data"
     output_dir: str = "output"
     llm_model: str = "gpt-4o"
+
+    def __post_init__(self) -> None:
+        self.topics = [topic.strip() for topic in self.topics if topic.strip()]
+        if not self.topics:
+            raise ValueError("topics must contain at least one non-empty topic")
+        if self.num_candidates <= 0:
+            raise ValueError("num_candidates must be positive")
+        if self.k <= 0:
+            raise ValueError("k must be positive")
+        if not 0.0 <= self.alpha <= 1.0:
+            raise ValueError("alpha must be in [0, 1]")
+        if not 0.0 <= self.lambda_diversity <= 1.0:
+            raise ValueError("lambda_diversity must be in [0, 1]")
+        if self.chunk_size <= 0:
+            raise ValueError("chunk_size must be positive")
+        if self.chunk_overlap < 0 or self.chunk_overlap >= self.chunk_size:
+            raise ValueError("chunk_overlap must satisfy 0 <= overlap < chunk_size")
+        if not self.m3e_path.strip():
+            raise ValueError("m3e_path must not be empty")
+        if not self.output_dir.strip():
+            raise ValueError("output_dir must not be empty")
+        if not self.llm_model.strip():
+            raise ValueError("llm_model must not be empty")
