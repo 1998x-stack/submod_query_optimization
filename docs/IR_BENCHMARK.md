@@ -100,6 +100,7 @@ Example:
       --num-candidates 20 \
       --k 6 \
       --ir-cutoffs 5,10,20 \
+      --ir-k-grid 2,4,6,8 \
       --ir-alpha-grid 0.2,0.5,0.8 \
       --ir-lambda-grid 0.2,0.5,0.8 \
       --ir-mmr-grid 0.3,0.6,0.9 \
@@ -108,7 +109,7 @@ Example:
       --random-seed 42 \
       --output-dir output
 
-Graph Cut evaluates the Cartesian product of ir-alpha-grid × ir-lambda-grid.
+Each non-original method is evaluated for every value in ir-k-grid. Graph Cut evaluates the Cartesian product of ir-k-grid × ir-alpha-grid × ir-lambda-grid.
 
 ## Output artifacts
 
