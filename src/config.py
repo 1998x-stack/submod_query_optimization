@@ -6,10 +6,15 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 
+def _validate_probability_grid(name: str, values: tuple[float, ...]) -> None:
+    if not values:
+        raise ValueError(f"{name} must not be empty")
+    if any(not 0.0 <= value <= 1.0 for value in values):
+        raise ValueError(f"{name} values must be in [0, 1]")
+
+
 @dataclass(slots=True)
 class EmbeddingConfig:
-    """Embedding model configuration."""
-
     model_path: str = "model"
     batch_size: int = 32
     device: str | None = None
@@ -23,8 +28,6 @@ class EmbeddingConfig:
 
 @dataclass(slots=True)
 class LLMConfig:
-    """OpenAI client and generation configuration."""
-
     model_name: str = "gpt-4o"
     temperature: float = 0.7
     max_tokens: int = 800
@@ -50,8 +53,6 @@ class LLMConfig:
 
 @dataclass(slots=True)
 class ExperimentConfig:
-    """Experiment-level parameters."""
-
     topics: list[str]
     num_candidates: int = 20
     k: int = 6
@@ -67,6 +68,15 @@ class ExperimentConfig:
     llm_model: str = "gpt-4o"
     candidate_cache_dir: str = ".cache/candidates"
     use_candidate_cache: bool = True
+
+    ir_dataset_dir: str | None = None
+    ir_cutoffs: tuple[int, ...] = (5, 10, 20)
+    ir_k_grid: tuple[int, ...] | None = None
+    ir_alpha_grid: tuple[float, ...] = (0.5,)
+    ir_lambda_grid: tuple[float, ...] = (0.5,)
+    ir_mmr_grid: tuple[float, ...] = (0.6,)
+    ir_random_repeats: int = 5
+    ir_bootstrap_iterations: int = 2000
 
     def __post_init__(self) -> None:
         self.topics = [topic.strip() for topic in self.topics if topic.strip()]
@@ -96,3 +106,25 @@ class ExperimentConfig:
             raise ValueError("llm_model must not be empty")
         if self.use_candidate_cache and not self.candidate_cache_dir.strip():
             raise ValueError("candidate_cache_dir must not be empty when cache is enabled")
+
+        if self.ir_dataset_dir is not None:
+            self.ir_dataset_dir = self.ir_dataset_dir.strip()
+            if not self.ir_dataset_dir:
+                raise ValueError("ir_dataset_dir must not be empty")
+        if not self.ir_cutoffs or any(cutoff <= 0 for cutoff in self.ir_cutoffs):
+            raise ValueError("ir_cutoffs must contain positive integers")
+        if len(set(self.ir_cutoffs)) != len(self.ir_cutoffs):
+            raise ValueError("ir_cutoffs must not contain duplicates")
+        if self.ir_k_grid is None:
+            self.ir_k_grid = (self.k,)
+        if not self.ir_k_grid or any(value <= 0 for value in self.ir_k_grid):
+            raise ValueError("ir_k_grid must contain positive integers")
+        if len(set(self.ir_k_grid)) != len(self.ir_k_grid):
+            raise ValueError("ir_k_grid must not contain duplicates")
+        _validate_probability_grid("ir_alpha_grid", self.ir_alpha_grid)
+        _validate_probability_grid("ir_lambda_grid", self.ir_lambda_grid)
+        _validate_probability_grid("ir_mmr_grid", self.ir_mmr_grid)
+        if self.ir_random_repeats <= 0:
+            raise ValueError("ir_random_repeats must be positive")
+        if self.ir_bootstrap_iterations <= 0:
+            raise ValueError("ir_bootstrap_iterations must be positive")

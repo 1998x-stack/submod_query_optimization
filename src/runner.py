@@ -122,6 +122,10 @@ class AblationRunner:
             "user_prompt": user_prompt,
         }
 
+    def get_candidates(self, topic: str, mode: str) -> list[str]:
+        """Public candidate-provider interface reused by the IR benchmark."""
+        return self._get_candidates(topic, mode)
+
     def _get_candidates(self, topic: str, mode: str) -> list[str]:
         """Reuse candidate sets in memory and, optionally, across process runs."""
         key = (topic, mode)
