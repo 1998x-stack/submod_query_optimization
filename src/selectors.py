@@ -1,12 +1,11 @@
 # -*- coding: utf-8 -*-
-"""Greedy selectors: standard greedy and lazy greedy (heap-based)."""
+"""Greedy selectors: standard greedy and CELF-style lazy greedy."""
 
 from __future__ import annotations
 
-import math
+import heapq
 import time
 from dataclasses import dataclass
-from typing import List, Tuple
 
 import numpy as np
 from loguru import logger
@@ -17,7 +16,7 @@ from src.utils import is_finite_and_positive
 
 @dataclass
 class GreedyResult:
-    """贪心选择结果。"""
+    """Greedy-selection result and diagnostics."""
 
     selected_indices: list[int]
     objective_values: list[float]
@@ -26,79 +25,103 @@ class GreedyResult:
     algo_name: str
 
 
+def _validate_budget(k: int, n: int) -> int:
+    if k < 0:
+        raise ValueError("k must be non-negative")
+    return min(int(k), int(n))
+
+
 class StandardGreedySelector:
-    """标准贪心：每轮重算所有候选的边际增益。"""
+    """Standard greedy: recompute every remaining marginal gain each round."""
 
     def __init__(self, objective: BaseSubmodularObjective) -> None:
         self.objective = objective
 
     def select(self, k: int) -> GreedyResult:
-        start = time.time()
+        start = time.perf_counter()
         self.objective.reset_state()
-        n = getattr(self.objective, "n")
+        n = int(self.objective.n)
+        budget = _validate_budget(k, n)
+
         selected: list[int] = []
         gains_all: list[float] = []
         values: list[float] = []
 
-        for _ in range(k):
-            gains = np.full((n,), -np.inf, dtype=np.float32)
+        for _ in range(budget):
+            gains = np.full((n,), -np.inf, dtype=np.float64)
             for idx in range(n):
                 gains[idx] = self.objective.marginal_gain(idx)
+
             best_idx = int(np.argmax(gains))
             best_gain = float(gains[best_idx])
             if not is_finite_and_positive(best_gain):
-                logger.debug("⏹️ 标准贪心提前停止（剩余无正增益）")
+                logger.debug("Standard greedy stopped: no positive finite gain remains")
                 break
+
             self.objective.add_to_set(best_idx)
             selected.append(best_idx)
             gains_all.append(best_gain)
             values.append(self.objective.total_value(selected))
 
-        runtime = time.time() - start
-        logger.info("🧮 StandardGreedy done in {:.3f}s, selected={}", runtime, len(selected))
+        runtime = time.perf_counter() - start
+        logger.info("StandardGreedy done in {:.3f}s, selected={}", runtime, len(selected))
         return GreedyResult(selected, values, gains_all, runtime, "standard_greedy")
 
 
 class LazyGreedySelector:
-    """懒贪心：最大堆 + 按需“懒重算”避免无谓计算。"""
+    """CELF-style lazy greedy for submodular objectives.
+
+    Cached marginal gains are upper bounds after the selected set grows because
+    submodularity implies diminishing returns. A candidate is accepted only
+    after its gain has been recomputed for the current step and it remains at
+    the top of the heap.
+    """
 
     def __init__(self, objective: BaseSubmodularObjective) -> None:
         self.objective = objective
 
     def select(self, k: int) -> GreedyResult:
-        import heapq
-
-        start = time.time()
+        start = time.perf_counter()
         self.objective.reset_state()
-        n = getattr(self.objective, "n")
+        n = int(self.objective.n)
+        budget = _validate_budget(k, n)
+
         selected: list[int] = []
         gains_all: list[float] = []
         values: list[float] = []
 
-        # 初始化堆（最大堆 -> 用负数）
+        if budget == 0:
+            return GreedyResult(selected, values, gains_all, 0.0, "lazy_greedy")
+
         gains0 = self.objective.initial_gains()
-        heap: list[Tuple[float, int, int]] = [(-float(g), -1, i) for i, g in enumerate(gains0)]
+        if gains0.shape != (n,):
+            raise ValueError("initial_gains must return shape (n,)")
+
+        heap: list[tuple[float, int, int]] = [
+            (-float(gain), -1, idx) for idx, gain in enumerate(gains0)
+        ]
         heapq.heapify(heap)
 
         step = 0
-        while step < k and heap:
-            neg_gain, last_step, idx = heapq.heappop(heap)
-            current_gain = -neg_gain
-            if last_step != step:
-                true_gain = self.objective.marginal_gain(idx)
+        while step < budget and heap:
+            neg_gain, evaluated_at_step, idx = heapq.heappop(heap)
+
+            if evaluated_at_step != step:
+                true_gain = float(self.objective.marginal_gain(idx))
                 heapq.heappush(heap, (-true_gain, step, idx))
                 continue
 
+            current_gain = -neg_gain
             if not is_finite_and_positive(current_gain):
-                logger.debug("⏹️ 懒贪心提前停止（剩余无正增益）")
+                logger.debug("Lazy greedy stopped: no positive finite gain remains")
                 break
 
             self.objective.add_to_set(idx)
             selected.append(idx)
-            gains_all.append(float(current_gain))
+            gains_all.append(current_gain)
             values.append(self.objective.total_value(selected))
             step += 1
 
-        runtime = time.time() - start
-        logger.info("⚡ LazyGreedy done in {:.3f}s, selected={}", runtime, len(selected))
+        runtime = time.perf_counter() - start
+        logger.info("LazyGreedy done in {:.3f}s, selected={}", runtime, len(selected))
         return GreedyResult(selected, values, gains_all, runtime, "lazy_greedy")
