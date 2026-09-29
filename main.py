@@ -67,6 +67,7 @@ def parse_args() -> argparse.Namespace:
         help="run only the qrels-backed IR benchmark",
     )
     parser.add_argument("--ir-cutoffs", type=_csv_ints, default=(5, 10, 20))
+    parser.add_argument("--ir-k-grid", type=_csv_ints, default=None)
     parser.add_argument("--ir-alpha-grid", type=_csv_floats, default=(0.5,))
     parser.add_argument("--ir-lambda-grid", type=_csv_floats, default=(0.5,))
     parser.add_argument("--ir-mmr-grid", type=_csv_floats, default=(0.6,))
@@ -100,6 +101,7 @@ def main() -> None:
         use_candidate_cache=not bool(args.no_candidate_cache),
         ir_dataset_dir=args.ir_dataset_dir,
         ir_cutoffs=tuple(args.ir_cutoffs),
+        ir_k_grid=tuple(args.ir_k_grid) if args.ir_k_grid is not None else None,
         ir_alpha_grid=tuple(args.ir_alpha_grid),
         ir_lambda_grid=tuple(args.ir_lambda_grid),
         ir_mmr_grid=tuple(args.ir_mmr_grid),
