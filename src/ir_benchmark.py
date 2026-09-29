@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import csv
 import json
-from dataclasses import asdict
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
@@ -17,7 +17,7 @@ from src.config import ExperimentConfig
 from src.embeddings import LangChainM3EEmbedder
 from src.ir_dataset import IRDataset, IRQuery
 from src.ir_metrics import IRMetrics, evaluate_ranking
-from src.ir_retrieval import DenseMultiQueryRetriever
+from src.ir_retrieval import DenseMultiQueryRetriever, RetrievalResult
 from src.ir_stats import bootstrap_mean_ci
 from src.objectives import FacilityLocationObjective, GraphCutObjective
 from src.selectors import LazyGreedySelector
@@ -27,10 +27,25 @@ from src.utils import cosine_similarity_matrix, pairwise_cosine
 CandidateProvider = Callable[[str, str], list[str]]
 
 
+@dataclass(frozen=True, slots=True)
+class SelectionRun:
+    variant: str
+    run_index: int
+    selected_indices: list[int]
+    runtime_sec: float
+
+
 class IRBenchmarkRunner:
-    """Evaluate selected expansion queries against document-level ground truth."""
+    """Evaluate expansion-query selection against document-level ground truth."""
 
     METRIC_NAMES = ("precision", "recall", "hit_rate", "reciprocal_rank", "ndcg")
+    SUMMARY_NAMES = {
+        "precision": "precision",
+        "recall": "recall",
+        "hit_rate": "hit_rate",
+        "reciprocal_rank": "mrr",
+        "ndcg": "ndcg",
+    }
 
     def __init__(
         self,
@@ -59,12 +74,11 @@ class IRBenchmarkRunner:
         max_cutoff = max(self.cfg.ir_cutoffs)
 
         for query in self.dataset.queries:
-            rows = self._run_query(query, max_cutoff)
-            detail_rows.extend(rows)
+            detail_rows.extend(self._run_query(query, max_cutoff))
 
-        self._write_detail(detail_rows)
+        self._write_csv(self.output_dir / "ir_benchmark_detail.csv", detail_rows)
         summary_rows = self._summarize(detail_rows)
-        self._write_summary(summary_rows)
+        self._write_csv(self.output_dir / "ir_benchmark_summary.csv", summary_rows)
         self._write_manifest()
 
         logger.info(
@@ -98,12 +112,15 @@ class IRBenchmarkRunner:
         qrels = self.dataset.qrels[query.query_id]
         rows: list[dict[str, object]] = []
 
-        for variant, run_index, selected_indices in selections:
+        for selection in selections:
             selected_embeddings = (
-                candidate_embeddings[selected_indices]
-                if selected_indices
+                candidate_embeddings[selection.selected_indices]
+                if selection.selected_indices
                 else np.empty((0, candidate_embeddings.shape[1]), dtype=np.float32)
             )
+
+            # The original query is always preserved. Selection methods only
+            # decide which expansion queries are added.
             retrieval_embeddings = np.concatenate(
                 [original_embedding, selected_embeddings],
                 axis=0,
@@ -118,10 +135,10 @@ class IRBenchmarkRunner:
                 rows.append(
                     self._detail_row(
                         query=query,
-                        variant=variant,
-                        run_index=run_index,
-                        selected_count=len(selected_indices),
+                        candidates=candidates,
+                        selection=selection,
                         candidate_count=len(candidates),
+                        ranking=ranking,
                         metrics=metrics,
                     )
                 )
@@ -134,62 +151,89 @@ class IRBenchmarkRunner:
         query: IRQuery,
         similarity: np.ndarray,
         relevance: np.ndarray,
-    ) -> list[tuple[str, int, list[int]]]:
-        selections: list[tuple[str, int, list[int]]] = [
-            ("OriginalQuery", 0, []),
-            (
-                "TopRelevance",
-                0,
-                top_relevance_select(similarity, relevance, self.cfg.k).selected_indices,
-            ),
+    ) -> list[SelectionRun]:
+        selections = [
+            SelectionRun("OriginalQuery", 0, [], 0.0),
         ]
 
+        top = top_relevance_select(similarity, relevance, self.cfg.k)
+        selections.append(
+            SelectionRun(
+                "TopRelevance",
+                0,
+                top.selected_indices,
+                top.runtime_sec,
+            )
+        )
+
         for mmr_lambda in self.cfg.ir_mmr_grid:
-            selected = mmr_select(
+            result = mmr_select(
                 similarity,
                 relevance,
                 self.cfg.k,
                 lambda_relevance=mmr_lambda,
-            ).selected_indices
-            selections.append((f"MMR(lambda={mmr_lambda:g})", 0, selected))
+            )
+            selections.append(
+                SelectionRun(
+                    f"MMR(lambda={mmr_lambda:g})",
+                    0,
+                    result.selected_indices,
+                    result.runtime_sec,
+                )
+            )
 
         for alpha in self.cfg.ir_alpha_grid:
-            selected = LazyGreedySelector(
+            result = LazyGreedySelector(
                 FacilityLocationObjective(
                     similarity,
                     relevance,
                     alpha=alpha,
                 )
-            ).select(self.cfg.k).selected_indices
-            selections.append((f"FacilityLocation(alpha={alpha:g})", 0, selected))
+            ).select(self.cfg.k)
+            selections.append(
+                SelectionRun(
+                    f"FacilityLocation(alpha={alpha:g})",
+                    0,
+                    result.selected_indices,
+                    result.runtime_sec,
+                )
+            )
 
         for alpha in self.cfg.ir_alpha_grid:
             for lambda_div in self.cfg.ir_lambda_grid:
-                selected = LazyGreedySelector(
+                result = LazyGreedySelector(
                     GraphCutObjective(
                         similarity,
                         relevance,
                         alpha=alpha,
                         lambda_div=lambda_div,
                     )
-                ).select(self.cfg.k).selected_indices
+                ).select(self.cfg.k)
                 selections.append(
-                    (
+                    SelectionRun(
                         f"GraphCut(alpha={alpha:g},lambda={lambda_div:g})",
                         0,
-                        selected,
+                        result.selected_indices,
+                        result.runtime_sec,
                     )
                 )
 
         base_seed = derive_topic_seed(self.cfg.random_seed, query.query_id)
         for repeat in range(self.cfg.ir_random_repeats):
-            selected = random_select(
+            result = random_select(
                 similarity,
                 relevance,
                 self.cfg.k,
                 seed=base_seed + repeat,
-            ).selected_indices
-            selections.append(("Random", repeat, selected))
+            )
+            selections.append(
+                SelectionRun(
+                    "Random",
+                    repeat,
+                    result.selected_indices,
+                    result.runtime_sec,
+                )
+            )
 
         return selections
 
@@ -197,20 +241,29 @@ class IRBenchmarkRunner:
     def _detail_row(
         *,
         query: IRQuery,
-        variant: str,
-        run_index: int,
-        selected_count: int,
+        candidates: list[str],
+        selection: SelectionRun,
         candidate_count: int,
+        ranking: RetrievalResult,
         metrics: IRMetrics,
     ) -> dict[str, object]:
+        cutoff = metrics.cutoff
+        selected_queries = [
+            candidates[index] for index in selection.selected_indices
+        ]
         return {
             "query_id": query.query_id,
             "query_text": query.text,
-            "variant": variant,
-            "run_index": run_index,
+            "variant": selection.variant,
+            "run_index": selection.run_index,
             "candidate_count": candidate_count,
-            "selected_count": selected_count,
-            "cutoff": metrics.cutoff,
+            "selected_count": len(selection.selected_indices),
+            "selection_runtime_sec": selection.runtime_sec,
+            "selected_indices_json": json.dumps(selection.selected_indices),
+            "selected_queries_json": json.dumps(selected_queries, ensure_ascii=False),
+            "cutoff": cutoff,
+            "retrieved_doc_ids_json": json.dumps(ranking.doc_ids[:cutoff]),
+            "retrieved_scores_json": json.dumps(ranking.scores[:cutoff]),
             "precision": metrics.precision,
             "recall": metrics.recall,
             "hit_rate": metrics.hit_rate,
@@ -233,8 +286,8 @@ class IRBenchmarkRunner:
                     if row["variant"] == variant and row["cutoff"] == cutoff
                 ]
 
-                # Repeated random runs are averaged within each query before
-                # macro averaging/bootstrap so queries remain the sampling unit.
+                # Random repeats are averaged within each query before macro
+                # averaging/bootstrap so the statistical unit remains a query.
                 per_query: dict[str, dict[str, list[float]]] = {}
                 for row in matching:
                     query_metrics = per_query.setdefault(
@@ -259,20 +312,13 @@ class IRBenchmarkRunner:
                         iterations=self.cfg.ir_bootstrap_iterations,
                         seed=self.cfg.random_seed,
                     )
-                    output[f"{metric_name}_mean"] = ci.mean
-                    output[f"{metric_name}_ci_low"] = ci.low
-                    output[f"{metric_name}_ci_high"] = ci.high
+                    output_name = self.SUMMARY_NAMES[metric_name]
+                    output[f"{output_name}_mean"] = ci.mean
+                    output[f"{output_name}_ci_low"] = ci.low
+                    output[f"{output_name}_ci_high"] = ci.high
                 summary.append(output)
 
         return summary
-
-    def _write_detail(self, rows: list[dict[str, object]]) -> None:
-        path = self.output_dir / "ir_benchmark_detail.csv"
-        self._write_csv(path, rows)
-
-    def _write_summary(self, rows: list[dict[str, object]]) -> None:
-        path = self.output_dir / "ir_benchmark_summary.csv"
-        self._write_csv(path, rows)
 
     @staticmethod
     def _write_csv(path: Path, rows: list[dict[str, object]]) -> None:
@@ -306,13 +352,27 @@ class IRBenchmarkRunner:
             "mmr_grid": list(self.cfg.ir_mmr_grid),
             "random_repeats": self.cfg.ir_random_repeats,
             "bootstrap_iterations": self.cfg.ir_bootstrap_iterations,
+            "metric_semantics": {
+                "binary_relevant": "qrel > 0",
+                "unjudged_documents": "treated as non-relevant",
+                "precision": "Precision@k with denominator k",
+                "recall": "Recall@k over all positive qrels",
+                "hit_rate": "1 if any positive qrel appears in top-k",
+                "mrr": "mean reciprocal rank of first positive qrel within top-k",
+                "ndcg": "graded nDCG@k using gain=2^rel-1",
+                "aggregation": "macro average across queries",
+                "confidence_interval": "percentile bootstrap across query-level values",
+            },
             "retrieval": {
                 "similarity": "cosine",
-                "fusion": "max",
-                "query_set": "original query + selected expansion queries",
+                "fusion": "max over original + selected expansion queries",
+                "query_set": "original query is always retained",
             },
         }
         path = self.output_dir / "ir_benchmark_manifest.json"
         tmp = path.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
         tmp.replace(path)
