@@ -1,5 +1,15 @@
 # -*- coding: utf-8 -*-
-"""Offline IR benchmark dataset loader with explicit qrels."""
+"""Offline IR benchmark dataset loader with explicit qrels.
+
+Supported layouts:
+1) Native:
+   documents.jsonl, queries.jsonl, qrels.tsv
+2) BEIR-style:
+   corpus.jsonl, queries.jsonl, qrels/test.tsv
+
+JSONL ids may use doc_id/query_id or _id. Corpus text may include title + text.
+Qrels accept 3-column (qid, docid, relevance) or 4-column TREC format.
+"""
 
 from __future__ import annotations
 
@@ -22,8 +32,6 @@ class IRQuery:
 
 @dataclass(frozen=True, slots=True)
 class IRDataset:
-    """Documents, benchmark queries, and graded relevance judgments."""
-
     documents: tuple[IRDocument, ...]
     queries: tuple[IRQuery, ...]
     qrels: dict[str, dict[str, int]]
@@ -34,13 +42,19 @@ class IRDataset:
         if not root.is_dir():
             raise FileNotFoundError(f"IR dataset directory not found: {root}")
 
-        documents = cls._load_jsonl(
-            root / "documents.jsonl", id_key="doc_id", record_type=IRDocument
+        document_path = cls._first_existing(
+            root / "documents.jsonl",
+            root / "corpus.jsonl",
         )
-        queries = cls._load_jsonl(
-            root / "queries.jsonl", id_key="query_id", record_type=IRQuery
+        query_path = cls._first_existing(root / "queries.jsonl")
+        qrels_path = cls._first_existing(
+            root / "qrels.tsv",
+            root / "qrels" / "test.tsv",
         )
-        qrels = cls._load_qrels(root / "qrels.tsv")
+
+        documents = cls._load_documents(document_path)
+        queries = cls._load_queries(query_path)
+        qrels = cls._load_qrels(qrels_path)
 
         doc_ids = {doc.doc_id for doc in documents}
         query_ids = {query.query_id for query in queries}
@@ -72,12 +86,20 @@ class IRDataset:
         return cls(tuple(documents), tuple(queries), qrels)
 
     @staticmethod
-    def _load_jsonl(path: Path, id_key: str, record_type):
-        if not path.is_file():
-            raise FileNotFoundError(f"required dataset file not found: {path}")
+    def _first_existing(*paths: Path) -> Path:
+        for path in paths:
+            if path.is_file():
+                return path
+        raise FileNotFoundError(
+            "none of the required dataset files exist: "
+            + ", ".join(str(path) for path in paths)
+        )
 
-        records = []
+    @staticmethod
+    def _load_documents(path: Path) -> list[IRDocument]:
+        records: list[IRDocument] = []
         seen: set[str] = set()
+
         with path.open("r", encoding="utf-8") as handle:
             for line_number, raw in enumerate(handle, start=1):
                 raw = raw.strip()
@@ -88,50 +110,96 @@ class IRDataset:
                 except json.JSONDecodeError as exc:
                     raise ValueError(f"{path}:{line_number}: invalid JSON") from exc
 
-                identifier = str(obj.get(id_key, "")).strip()
-                text = str(obj.get("text", "")).strip()
-                if not identifier or not text:
+                doc_id = str(obj.get("doc_id") or obj.get("_id") or "").strip()
+                title = str(obj.get("title") or "").strip()
+                body = str(obj.get("text") or "").strip()
+                text = "\n".join(part for part in (title, body) if part)
+
+                if not doc_id or not text:
                     raise ValueError(
-                        f"{path}:{line_number}: {id_key} and text must be non-empty"
+                        f"{path}:{line_number}: doc_id/_id and text must be non-empty"
                     )
-                if identifier in seen:
-                    raise ValueError(f"{path}:{line_number}: duplicate {id_key}={identifier!r}")
-                seen.add(identifier)
-                records.append(record_type(identifier, text))
+                if doc_id in seen:
+                    raise ValueError(f"{path}:{line_number}: duplicate doc id={doc_id!r}")
+                seen.add(doc_id)
+                records.append(IRDocument(doc_id, text))
 
         if not records:
-            raise ValueError(f"{path} contains no records")
+            raise ValueError(f"{path} contains no documents")
+        return records
+
+    @staticmethod
+    def _load_queries(path: Path) -> list[IRQuery]:
+        records: list[IRQuery] = []
+        seen: set[str] = set()
+
+        with path.open("r", encoding="utf-8") as handle:
+            for line_number, raw in enumerate(handle, start=1):
+                raw = raw.strip()
+                if not raw:
+                    continue
+                try:
+                    obj = json.loads(raw)
+                except json.JSONDecodeError as exc:
+                    raise ValueError(f"{path}:{line_number}: invalid JSON") from exc
+
+                query_id = str(obj.get("query_id") or obj.get("_id") or "").strip()
+                text = str(obj.get("text") or "").strip()
+                if not query_id or not text:
+                    raise ValueError(
+                        f"{path}:{line_number}: query_id/_id and text must be non-empty"
+                    )
+                if query_id in seen:
+                    raise ValueError(
+                        f"{path}:{line_number}: duplicate query id={query_id!r}"
+                    )
+                seen.add(query_id)
+                records.append(IRQuery(query_id, text))
+
+        if not records:
+            raise ValueError(f"{path} contains no queries")
         return records
 
     @staticmethod
     def _load_qrels(path: Path) -> dict[str, dict[str, int]]:
-        if not path.is_file():
-            raise FileNotFoundError(f"required dataset file not found: {path}")
-
         qrels: dict[str, dict[str, int]] = {}
+
         with path.open("r", encoding="utf-8") as handle:
             for line_number, raw in enumerate(handle, start=1):
                 raw = raw.strip()
                 if not raw or raw.startswith("#"):
                     continue
-                parts = raw.split("\t")
-                if parts == ["query_id", "doc_id", "relevance"]:
+
+                parts = raw.split("\t") if "\t" in raw else raw.split()
+                normalized_header = [part.strip().lower() for part in parts]
+                if normalized_header in (
+                    ["query_id", "doc_id", "relevance"],
+                    ["query-id", "corpus-id", "score"],
+                ):
                     continue
-                if len(parts) != 3:
+
+                if len(parts) == 3:
+                    query_id, doc_id, relevance_raw = parts
+                elif len(parts) == 4:
+                    query_id, _iteration, doc_id, relevance_raw = parts
+                else:
                     raise ValueError(
-                        f"{path}:{line_number}: expected query_id<TAB>doc_id<TAB>relevance"
+                        f"{path}:{line_number}: expected 3-column qrels or 4-column TREC qrels"
                     )
-                query_id, doc_id, relevance_raw = (part.strip() for part in parts)
+
+                query_id = query_id.strip()
+                doc_id = doc_id.strip()
                 if not query_id or not doc_id:
                     raise ValueError(f"{path}:{line_number}: ids must be non-empty")
                 try:
-                    relevance = int(relevance_raw)
+                    relevance = int(relevance_raw.strip())
                 except ValueError as exc:
                     raise ValueError(
                         f"{path}:{line_number}: relevance must be an integer"
                     ) from exc
                 if relevance < 0:
                     raise ValueError(f"{path}:{line_number}: relevance must be non-negative")
+
                 per_query = qrels.setdefault(query_id, {})
                 if doc_id in per_query:
                     raise ValueError(
