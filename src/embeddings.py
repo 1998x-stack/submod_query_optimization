@@ -1,23 +1,18 @@
 # -*- coding: utf-8 -*-
-"""LangChain-based embeddings wrapper for local m3e.
-
-本模块使用 LangChain 的 `SentenceTransformerEmbeddings`，
-从本地目录加载 m3e 模型，并提供统一的 encode 接口。
-"""
+"""LangChain-based embedding wrapper for a local sentence-transformer model."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 from loguru import logger
 
-# LangChain Embeddings（0.2 之后位于 community 包）
 try:
     from langchain_community.embeddings import SentenceTransformerEmbeddings
-except Exception as exc:  # pragma: no cover
+except ImportError as exc:  # pragma: no cover - dependency boundary
     raise RuntimeError(
-        "未找到 langchain_community.embeddings，请安装：pip install langchain-community"
+        "langchain-community is required; install project dependencies first"
     ) from exc
 
 from src.config import EmbeddingConfig
@@ -25,32 +20,47 @@ from src.config import EmbeddingConfig
 
 @dataclass
 class LangChainM3EEmbedder:
-    """基于 LangChain 的 m3e 向量封装。"""
+    """Expose a small numpy-oriented embedding interface."""
 
     cfg: EmbeddingConfig
+    _dimension: int | None = field(init=False, default=None, repr=False)
 
     def __post_init__(self) -> None:
-        # LangChain 的 SentenceTransformerEmbeddings 支持本地路径
-        logger.info("🔧 Loading local m3e model from: {}", self.cfg.model_path)
+        logger.info("Loading local embedding model from: {}", self.cfg.model_path)
         self._emb = SentenceTransformerEmbeddings(
             model_name=self.cfg.model_path,
             cache_folder=None,
             model_kwargs={"device": self.cfg.device} if self.cfg.device else {},
-            encode_kwargs={"batch_size": self.cfg.batch_size, "normalize_embeddings": False},
+            encode_kwargs={
+                "batch_size": self.cfg.batch_size,
+                "normalize_embeddings": False,
+            },
         )
-        logger.info("✅ m3e is ready (batch_size={}, device={})", self.cfg.batch_size, self.cfg.device)
+        logger.info(
+            "Embedding model ready (batch_size={}, device={})",
+            self.cfg.batch_size,
+            self.cfg.device,
+        )
 
     def encode(self, texts: list[str]) -> np.ndarray:
-        """编码一批文本为向量（float32）。
-
-        Args:
-            texts: 文本列表。
-
-        Returns:
-            (n,d) numpy 数组。
-        """
+        """Encode texts as a float32 (n, d) matrix."""
         if not texts:
-            return np.zeros((0, 768), dtype=np.float32)
-        vecs = self._emb.embed_documents(texts)  # List[List[float]]
+            dim = self._dimension or 0
+            return np.empty((0, dim), dtype=np.float32)
+
+        vecs = self._emb.embed_documents(texts)
         arr = np.asarray(vecs, dtype=np.float32)
+        if arr.ndim != 2 or arr.shape[0] != len(texts):
+            raise RuntimeError(
+                f"embedding backend returned invalid shape {arr.shape} for {len(texts)} texts"
+            )
+        if not np.isfinite(arr).all():
+            raise RuntimeError("embedding backend returned non-finite values")
+
+        if self._dimension is None:
+            self._dimension = int(arr.shape[1])
+        elif arr.shape[1] != self._dimension:
+            raise RuntimeError(
+                f"embedding dimension changed from {self._dimension} to {arr.shape[1]}"
+            )
         return arr
