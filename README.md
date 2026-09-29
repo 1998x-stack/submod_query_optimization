@@ -35,6 +35,7 @@ Phase 3 会对 OriginalQuery、TopRelevance、MMR、Random、Facility Location�
       --ir-dataset-dir examples/ir_dataset \
       --m3e-path model \
       --ir-cutoffs 5,10,20 \
+      --ir-k-grid 2,4,6,8 \
       --ir-alpha-grid 0.2,0.5,0.8 \
       --ir-lambda-grid 0.2,0.5,0.8 \
       --ir-mmr-grid 0.3,0.6,0.9 \
