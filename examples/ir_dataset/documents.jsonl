@@ -1,0 +1,4 @@
+{"doc_id":"d1","text":"Dense retrieval represents queries and documents as vectors and ranks by vector similarity."}
+{"doc_id":"d2","text":"Maximal marginal relevance balances relevance with redundancy reduction in retrieval."}
+{"doc_id":"d3","text":"Submodular facility location objectives reward representative coverage of a candidate set."}
+{"doc_id":"d4","text":"Weather forecasting uses atmospheric observations and numerical simulation."}

@@ -2,6 +2,48 @@
 
 面向“少而多样”的搜索查询选择实验与 Benchmark：先由 LLM 生成候选查询，再使用多种查询选择算法压缩候选集合，并从相关性、多样性、语料覆盖和运行时间多个维度进行统一比较。
 
+## Phase 3：真实 Information Retrieval Benchmark
+
+现已支持基于显式 qrels / ground truth 的真实离线检索评估，而不再只依赖 embedding coverage proxy。
+
+Phase 3 会对 OriginalQuery、TopRelevance、MMR、Random、Facility Location、Graph Cut 在同一文档集合和同一 qrels 上计算：
+
+- Precision@K
+- Recall@K
+- HitRate@K
+- MRR@K
+- nDCG@K
+- query-level macro average
+- deterministic bootstrap 95% confidence interval
+
+同时支持：
+
+- BEIR-style corpus.jsonl / queries.jsonl / qrels/test.tsv
+- 3 列 qrels 与 4 列 TREC qrels
+- Facility Location alpha sweep
+- Graph Cut alpha × lambda sweep
+- MMR lambda sweep
+- Random 多 seed 重复实验
+- 完整 retrieval ranking / selected expansion 审计输出
+
+快速运行：
+
+    export OPENAI_API_KEY=sk-...
+
+    python main.py \
+      --ir-only \
+      --ir-dataset-dir examples/ir_dataset \
+      --m3e-path model \
+      --ir-cutoffs 5,10,20 \
+      --ir-k-grid 2,4,6,8 \
+      --ir-alpha-grid 0.2,0.5,0.8 \
+      --ir-lambda-grid 0.2,0.5,0.8 \
+      --ir-mmr-grid 0.3,0.6,0.9 \
+      --ir-random-repeats 10 \
+      --output-dir output
+
+完整实验协议、指标定义、数据格式和统计口径见 docs/IR_BENCHMARK.md。
+
 ## 当前能力
 
 ### 1. Prompt 消融
@@ -246,12 +288,4 @@ CI 在 Python 3.10 / 3.11 / 3.12 上执行：
 - Random baseline 不可复现
 - 结果缺少统一 CSV
 
-下一阶段适合继续加入：
-
-- 带 relevance judgments 的离线检索数据集
-- Recall@K / MRR / nDCG
-- 多 seed 重复实验与置信区间
-- 参数 sweep（alpha / lambda / MMR lambda / k）
-- benchmark artifact 可视化
-- embedding 缓存
-- `v1.py` 迁移到 `legacy/`
+Phase 3 已补齐 qrels-backed IR dataset、Recall/Precision/HitRate/MRR/nDCG、多 seed、bootstrap CI 与参数 sweep。后续更适合继续加入 benchmark 可视化、embedding 缓存、dev/test split 自动化以及 `v1.py` 迁移到 `legacy/`。
